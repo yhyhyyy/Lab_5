@@ -1,0 +1,181 @@
+---
+title: "Lab5"
+author: "Haoyu"
+format: html
+editor: visual
+embed-resources: true
+---
+
+## Setup in R
+
+1.  Load the data.table (and the dtplyr and dplyr packages if you plan to work with those).
+
+2.  Load the met data from https://raw.githubusercontent.com/USCbiostats/data-science-data/master/02_met/met_all.gz, and also the station data. For the later, you can use the code we used during lecture to pre-process the stations data:
+
+```{r}
+library(data.table)
+library(dtplyr)
+library(tidyverse)
+met_url <- "https://github.com/USCbiostats/data-science-data/raw/master/02_met/met_all.gz"
+tmp <- "met.gz"
+if (!file.exists(tmp)) {
+  download.file(
+    url      = met_url,
+    destfile = tmp,
+    # method   = "libcurl", timeout = 1000 (you may need this option)
+  )
+}
+dat <- fread(tmp)
+dat <- as.data.frame(dat)
+```
+
+3.  Merge the data as we did during the lecture.
+
+```{r}
+stations <- fread("https://noaa-isd-pds.s3.amazonaws.com/isd-history.csv")
+stations[, USAF := as.integer(USAF)]
+
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+stations <- stations[!is.na(USAF)]
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+dat <- merge(
+  x     = dat,      
+  y     = stations, 
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  all.x = TRUE,      
+  all.y = FALSE
+  )
+```
+
+## Question 1:Representative station for the US
+
+What is the median station in terms of temperature, wind speed, and atmospheric pressure? Look for the three weather stations that best represent continental US using the quantile() function. Do these three coincide?
+
+```{r}
+# Reading the data
+median_temp <- quantile(dat$temp, probs = 0.5, na.rm = TRUE)
+median_wind <- quantile(dat$wind.sp, probs = 0.5, na.rm = TRUE)
+median_pressure <- quantile(dat$atm.press, probs = 0.5, na.rm = TRUE)  
+median_temp_station <- dat[which.min(abs(dat$temp - median_temp)), ]
+median_wind_station <- dat[which.min(abs(dat$wind.sp - median_wind)), ]
+median_pressure_station <- dat[which.min(abs(dat$atm.press - median_pressure)), ]
+# Print the station information for each variable
+median_temp_station
+median_wind_station
+median_pressure_station
+```
+
+From the result, we can find that the median station of wind speed and atmospheric pressure are the same one (690150).
+
+## Question 2
+
+Just like the previous question, you are asked to identify what is the most representative, the median, station per state. This time, instead of looking at one variable at a time, look at the euclidean distance. If multiple stations show in the median, select the one located at the lowest latitude.
+
+```{r}
+state_medians <- dat %>%
+  group_by(STATE) %>%
+  summarise(
+    median_temp = median(temp, na.rm = TRUE),
+    median_wind = median(wind.sp, na.rm = TRUE),
+    median_press = median(atm.press, na.rm = TRUE)
+  )
+
+dat <- dat %>%
+  left_join(state_medians, by = "STATE") %>%
+  mutate(
+    distance = sqrt((temp - median_temp)^2 + (wind.sp - median_wind)^2 + (atm.press - median_press)^2)
+  )
+
+representative_stations_state <- dat %>%
+  group_by(STATE) %>%
+  filter(!is.na(distance)) %>%
+  filter(distance == min(distance, na.rm = TRUE)) %>%
+  arrange(lat) %>%
+  slice(1)  
+print(representative_stations_state %>% select("USAFID", "STATE","median_temp", "median_wind", "median_press", "distance"))
+```
+
+## Question 3
+
+For each state, identify what is the station that is closest to the mid-point of the state. Combining these with the stations you identified in the previous question, use leaflet() to visualize all \~100 points in the same figure, applying different colors for those identified in this question.
+
+```{r}
+#Question 3
+library(leaflet)
+
+state_midpoints <- dat %>%
+  group_by(STATE) %>%
+  summarise(
+    mid_lat = mean(lat, na.rm = TRUE),
+    mid_lon = mean(lon, na.rm = TRUE)
+  )
+closest_stations <- dat %>%
+  left_join(state_midpoints, by = "STATE") %>%
+  mutate(
+    distance = sqrt((lat - mid_lat)^2 + (lon - mid_lon)^2)
+  ) %>%
+  group_by(STATE) %>%
+  filter(distance == min(distance, na.rm = TRUE)) %>%
+  ungroup()
+
+leaflet() %>%
+  addTiles() %>%
+  addCircles(data = representative_stations_state,
+             lng = ~lon, lat = ~lat,
+             color = "blue", radius = 100, 
+             label = ~paste("Representative Station:", USAFID)) %>%
+  addCircles(data = closest_stations,
+             lng = ~lon, lat = ~lat,
+             color = "red", radius = 100, 
+             label = ~paste("Closest to Midpoint:", USAFID)) %>%
+  addLegend(position = "bottomright", 
+             colors = c("blue", "red"), 
+             labels = c("Representative Stations", "Closest to Midpoint"),
+             title = "Station Types")
+
+```
+
+## Question 4
+
+Using the quantile() function, generate a summary table that shows the number of states included, average temperature, wind-speed, and atmospheric pressure by the variable “average temperature level,” which you’ll need to create.
+
+```{r}
+state_summary <- dat %>%
+  group_by(STATE) %>%
+  summarise(
+    avg_temp = mean(temp, na.rm = TRUE),
+    avg_wind = mean(wind.sp, na.rm = TRUE),
+    avg_pressure = mean(atm.press, na.rm = TRUE),
+    num_entries = n(),
+    num_na = sum(is.na(temp) | is.na(wind.sp) | is.na(atm.press)),
+    num_stations = n_distinct(USAFID)
+  )
+
+state_summary <- state_summary %>%
+  mutate(
+    temp_level = case_when(
+      avg_temp < 20 ~ "low",
+      avg_temp >= 20 & avg_temp < 25 ~ "Mid",
+      avg_temp >= 25 ~ "High"
+    )
+  )
+summary_table <- state_summary %>%
+  group_by(temp_level) %>%
+  summarise(
+    num_states = n(),
+    mean_temp = mean(avg_temp, na.rm = TRUE),
+    mean_wind = mean(avg_wind, na.rm = TRUE),
+    mean_pressure = mean(avg_pressure, na.rm = TRUE),
+    total_entries = sum(num_entries),  
+    total_na_entries = sum(num_na),   
+    total_stations = sum(num_stations)   
+  )
+
+print(summary_table)
+
+```
